@@ -1,0 +1,9 @@
+camera:
+  scheme: http         # 也可以 https（建议最终开启）
+  host: 192.168.2.164  # 相机 IP
+  port: 80
+  username: admin
+  password: abcd1234
+  channel: 1           # 常见为 1；有些机型是 101
+server:
+  port: 7005

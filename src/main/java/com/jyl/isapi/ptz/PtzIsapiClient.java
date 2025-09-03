@@ -54,6 +54,139 @@ public class PtzIsapiClient implements AutoCloseable {
                 .build();
     }
 
+    /**
+     * 查询守望配置
+     * @param ch
+     * @return
+     * @throws IOException
+     */
+    public String getParkAction(int ch) throws IOException {
+        HttpGet get = new HttpGet(url("/ISAPI/PTZCtrl/channels/" + ch + "/parkAction"));
+        get.addHeader("Accept", "application/xml");
+        return client.execute(get, this::handleText);
+    }
+
+
+    /**
+     * 设置守望配置（enabled=true/false，parkTime 秒，actionType: preset/patrol，actionNum: 预置位号或巡航号）
+     * @param ch
+     * @param enabled
+     * @param parkTimeSec
+     * @param actionType
+     * @param actionNum
+     * @throws IOException
+     */
+    public void setParkAction(int ch, boolean enabled, int parkTimeSec, String actionType, int actionNum) throws IOException {
+        int t = Math.max(5, Math.min(720, parkTimeSec)); // 设备能力范围：5~720 秒
+        String at = ("patrol".equalsIgnoreCase(actionType) ? "patrol" : "preset"); // 兜底为 preset
+        String xml = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <ParkAction version="2.0" xmlns="http://www.hikvision.com/ver20/XMLSchema">
+          <enabled>%s</enabled>
+          <Parktime>%d</Parktime>
+          <Action><ActionType>%s</ActionType><ActionNum>%d</ActionNum></Action>
+        </ParkAction>
+        """.formatted(enabled ? "true" : "false", t, at, actionNum);
+        HttpPut put = new HttpPut(url("/ISAPI/PTZCtrl/channels/" + ch + "/parkAction"));
+        put.addHeader("Accept", "application/xml");
+        put.setEntity(new StringEntity(xml, ContentType.APPLICATION_XML));
+        client.execute(put, this::handleText);
+    }
+
+
+    /**
+     * 3D 增强方法
+     * @param ch
+     * @param x1
+     * @param y1
+     * @param x2
+     * @param y2
+     * @throws IOException
+     */
+    public void threeDZoomSmart(int ch, double x1, double y1, double x2, double y2) throws IOException {
+        // 1) 先 3D 对准
+        threeDZoomBox(ch, x1, y1, x2, y2);
+
+        // 2) 读当前倍率（稍等一会让马达起步）
+        try { Thread.sleep(150); } catch (InterruptedException ignored) {}
+        String status = getStatus(ch);
+        int zNow = parseInt(status, "<absoluteZoom>(\\d+)</absoluteZoom>", 20);
+
+        // 3) 根据框面积估算目标倍率（面积越小→目标越大）
+        double lx = Math.min(x1,x2), rx = Math.max(x1,x2);
+        double ty = Math.min(y1,y2), by = Math.max(y1,y2);
+        double area = Math.max(1e-4, (rx - lx) * (by - ty));  // 防止极小为0
+        // 经验系数：6 可按手感微调（3~8）
+        int zTarget = clampInt((int)Math.round(zNow + 6.0 * Math.log(1.0 / area)), 10, 40);
+
+        if (zTarget != zNow) {
+            // 绝对变倍（不改角度）
+            absoluteMoveDegrees(ch, null, null, zTarget);
+        }
+    }
+
+    private static int parseInt(String s, String pattern, int def) {
+        var m = java.util.regex.Pattern.compile(pattern).matcher(s);
+        return m.find() ? Integer.parseInt(m.group(1)) : def;
+    }
+
+
+    // 工具：归一化 + 0~255 映射
+    private static double clamp01(double v) {
+        return Math.max(0.0, Math.min(1.0, v));
+    }
+
+    private static int to255(double v) {
+        return (int) Math.round(clamp01(v) * 255.0);
+    }
+
+    /**
+     * 发送 Position3D ver10（PUT /position3D）
+     */
+    private void sendPosition3D(int channel, int x1, int y1, int x2, int y2) throws IOException {
+        String path = "/ISAPI/PTZCtrl/channels/" + channel + "/position3D";
+        String xml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <Position3D version="1.0" xmlns="http://www.hikvision.com/ver10/XMLSchema">
+                  <StartPoint><positionX>%d</positionX><positionY>%d</positionY></StartPoint>
+                  <EndPoint><positionX>%d</positionX><positionY>%d</positionY></EndPoint>
+                </Position3D>
+                """.formatted(x1, y1, x2, y2);
+
+        HttpPut put = new HttpPut(url(path));
+        put.addHeader("Accept", "application/xml");
+        put.setEntity(new StringEntity(xml, ContentType.APPLICATION_XML));
+        client.execute(put, this::handleText); // 2xx 即为成功
+    }
+
+    /**
+     * 3D 画框（0~1 归一化坐标，左上 (0,0)）
+     * 小框=放大；大框≈缩小
+     */
+    public void threeDZoomBox(int channel, double nx1, double ny1, double nx2, double ny2) throws IOException {
+        double lx = clamp01(Math.min(nx1, nx2));
+        double rx = clamp01(Math.max(nx1, nx2));
+        double ty = clamp01(Math.min(ny1, ny2));
+        double by = clamp01(Math.max(ny1, ny2));
+        sendPosition3D(channel, to255(lx), to255(ty), to255(rx), to255(by));
+    }
+
+    /**
+     * 点击放大：以 (x,y) 为中心的小框；size 越小，放得越猛（推荐 0.05~0.10）
+     */
+    public void threeDZoomInAt(int channel, double x, double y, double size) throws IOException {
+        double s = Math.max(0.02, Math.min(0.20, size));
+        threeDZoomBox(channel, x - s, y - s, x + s, y + s);
+    }
+
+    /**
+     * 点击缩小：以 (x,y) 为中心的大框（推荐 0.25~0.40）
+     */
+    public void threeDZoomOutAt(int channel, double x, double y, double size) throws IOException {
+        double s = Math.max(0.25, Math.min(0.49, size));
+        threeDZoomBox(channel, x - s, y - s, x + s, y + s);
+    }
+
     private String handleText(ClassicHttpResponse resp) throws IOException, ParseException {
         int code = resp.getCode();
         HttpEntity entity = resp.getEntity();
@@ -113,7 +246,6 @@ public class PtzIsapiClient implements AutoCloseable {
         put.setEntity(new StringEntity(xml, ContentType.APPLICATION_XML));
         client.execute(put, this::handleText);
     }*/
-
     public void continuousMove(int channel, double pan, double tilt, double zoom, int durationMs) throws IOException {
         int p = (int) Math.round(pan);
         int t = (int) Math.round(tilt);
@@ -124,7 +256,7 @@ public class PtzIsapiClient implements AutoCloseable {
         z = Math.max(-100, Math.min(100, z));
 
         String xml = "<PTZData>"
-                + "<pan>"  + p + "</pan>"
+                + "<pan>" + p + "</pan>"
                 + "<tilt>" + t + "</tilt>"
                 + "<zoom>" + z + "</zoom>"
                 + "<timeout>" + durationMs + "</timeout>"
@@ -147,7 +279,6 @@ public class PtzIsapiClient implements AutoCloseable {
         put.setEntity(new StringEntity(xml, ContentType.APPLICATION_XML));
         client.execute(put, this::handleText);
     }*/
-
     public void stop(int channel) throws IOException {
         IOException last = null;
 
@@ -159,7 +290,9 @@ public class PtzIsapiClient implements AutoCloseable {
             put.setEntity(new StringEntity(xml, ContentType.APPLICATION_XML));
             client.execute(put, this::handleText);
             return;
-        } catch (IOException e) { last = e; }
+        } catch (IOException e) {
+            last = e;
+        }
 
         // 方案2：POST /stop（个别固件需要 POST，无 body）
         try {
@@ -167,7 +300,9 @@ public class PtzIsapiClient implements AutoCloseable {
             post.addHeader("Accept", "application/xml");
             client.execute(post, this::handleText);
             return;
-        } catch (IOException e) { last = e; }
+        } catch (IOException e) {
+            last = e;
+        }
 
         // 方案3：0 速度连续移动，极短超时（通杀）
         try {
@@ -177,7 +312,9 @@ public class PtzIsapiClient implements AutoCloseable {
             put.setEntity(new StringEntity(xml, ContentType.APPLICATION_XML));
             client.execute(put, this::handleText);
             return;
-        } catch (IOException e) { last = e; }
+        } catch (IOException e) {
+            last = e;
+        }
 
         throw last; // 三种都失败才抛
     }
@@ -232,10 +369,11 @@ public class PtzIsapiClient implements AutoCloseable {
 
     /**
      * 绝对移动（按“度”传入），优先 /absolute (AbsoluteHigh, 0.1°刻度)，失败则回退 /absoluteEx（度）
-     * @param channel   PTZ 通道
-     * @param azimuthDeg    方位角（度，0~350）
-     * @param elevationDeg  俯仰角（度，-4.9~90.0）
-     * @param zoom          可选，倍率（10~40；按你的能力表）
+     *
+     * @param channel      PTZ 通道
+     * @param azimuthDeg   方位角（度，0~350）
+     * @param elevationDeg 俯仰角（度，-4.9~90.0）
+     * @param zoom         可选，倍率（10~40；按你的能力表）
      */
     public void absoluteMoveDegrees(int channel, Double azimuthDeg, Double elevationDeg, Integer zoom) throws IOException {
         // 你的能力范围（来自 /ptz/capabilities）
@@ -245,11 +383,11 @@ public class PtzIsapiClient implements AutoCloseable {
         Integer az10 = null, el10 = null;
 
         if (azimuthDeg != null) {
-            az10 = (int)Math.round(azimuthDeg * 10.0);
+            az10 = (int) Math.round(azimuthDeg * 10.0);
             az10 = clampInt(az10, 0, 3500);
         }
         if (elevationDeg != null) {
-            el10 = (int)Math.round(elevationDeg * 10.0);
+            el10 = (int) Math.round(elevationDeg * 10.0);
             el10 = clampInt(el10, -49, 900);
         }
         Integer z = (zoom != null) ? clampInt(zoom, 10, 40) : null;
@@ -264,7 +402,7 @@ public class PtzIsapiClient implements AutoCloseable {
             );
             if (el10 != null) sb.append("    <elevation>").append(el10).append("</elevation>\n");
             if (az10 != null) sb.append("    <azimuth>").append(az10).append("</azimuth>\n");
-            if (z != null)   sb.append("    <absoluteZoom>").append(z).append("</absoluteZoom>\n");
+            if (z != null) sb.append("    <absoluteZoom>").append(z).append("</absoluteZoom>\n");
             sb.append("  </AbsoluteHigh>\n</PTZData>");
 
             HttpPut put = new HttpPut(url("/ISAPI/PTZCtrl/channels/" + channel + "/absolute"));
@@ -282,9 +420,11 @@ public class PtzIsapiClient implements AutoCloseable {
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
                             "<PTZAbsoluteEx version=\"2.0\" xmlns=\"http://www.hikvision.com/ver20/XMLSchema\">\n"
             );
-            if (elevationDeg != null) sb.append("  <elevation>").append(String.format(java.util.Locale.US,"%.1f", elevationDeg)).append("</elevation>\n");
-            if (azimuthDeg != null)   sb.append("  <azimuth>").append(String.format(java.util.Locale.US,"%.1f", azimuthDeg)).append("</azimuth>\n");
-            if (z != null)            sb.append("  <absoluteZoom>").append(z).append("</absoluteZoom>\n");
+            if (elevationDeg != null)
+                sb.append("  <elevation>").append(String.format(java.util.Locale.US, "%.1f", elevationDeg)).append("</elevation>\n");
+            if (azimuthDeg != null)
+                sb.append("  <azimuth>").append(String.format(java.util.Locale.US, "%.1f", azimuthDeg)).append("</azimuth>\n");
+            if (z != null) sb.append("  <absoluteZoom>").append(z).append("</absoluteZoom>\n");
             sb.append("</PTZAbsoluteEx>");
 
             HttpPut putEx = new HttpPut(url("/ISAPI/PTZCtrl/channels/" + channel + "/absoluteEx"));
@@ -305,13 +445,14 @@ public class PtzIsapiClient implements AutoCloseable {
         return Math.max(min, Math.min(max, v));
     }
 
-    /** 读取 PTZ 状态（可拿到 AbsoluteHigh 当前角度/变倍） */
+    /**
+     * 读取 PTZ 状态（可拿到 AbsoluteHigh 当前角度/变倍）
+     */
     public String getStatus(int channel) throws IOException {
         HttpGet get = new HttpGet(url("/ISAPI/PTZCtrl/channels/" + channel + "/status"));
         get.addHeader("Accept", "application/xml");
         return client.execute(get, this::handleText);
     }
-
 
 
     @Override
